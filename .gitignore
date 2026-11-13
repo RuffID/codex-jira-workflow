@@ -1,0 +1,21 @@
+/client/tests/
+.vs/
+
+# Local repository bindings and Jira content
+/config.json
+/data/
+
+# Personal path in an installed skill
+**/references/local-client.json
+
+# Runtime logs and temporary files
+/logs/
+/tmp/
+/temp/
+*.log
+*.tmp
+*.part
+
+# Local environment secrets
+.env
+.env.*

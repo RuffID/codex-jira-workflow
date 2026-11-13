@@ -1,0 +1,5 @@
+interface:
+  display_name: "Jira workflow"
+  short_description: "Учёт времени и задачи Jira для разрешённых проектов"
+policy:
+  allow_implicit_invocation: true
