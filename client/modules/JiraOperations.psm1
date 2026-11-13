@@ -218,7 +218,10 @@ function New-JiraWorklogData {
 }
 
 function New-JiraProposal {
-    param($Context, $Binding, [string]$StatePath, [ValidateSet('worklog', 'transition', 'create')][string]$Kind, [Collections.IDictionary]$InputData, [string]$OperationId = '')
+    param($Context, $Binding, [string]$StatePath, [ValidateSet('worklog', 'transition', 'create', 'link', 'attachments')][string]$Kind, [Collections.IDictionary]$InputData, [string]$OperationId = '')
+    if ($Kind -in @('link', 'attachments') -or ($Kind -eq 'create' -and ($InputData.Contains('links') -or $InputData.Contains('attachments')))) {
+        return (New-JiraIssueWorkflowProposal $Context $Binding $StatePath $Kind $InputData -OperationId $OperationId)
+    }
     $id = if ($OperationId) { ([guid]::ParseExact($OperationId, 'D')).ToString('D') } else { [guid]::NewGuid().ToString('D') }
     $path = Get-JiraOperationPath $StatePath $id
     Assert-JiraPlainPath $path
@@ -318,8 +321,9 @@ function Invoke-JiraApprovedOperation {
     Assert-JiraOperationOwner $Context $Binding $operation
     if ($operation.requestHash -cne $RequestHash) { throw 'Confirmation hash does not match the prepared request.' }
     if ($operation.status -eq 'completed') { return $operation }
-    if ($operation.status -ne 'prepared') { throw 'Operation is not prepared. Do not resend an uncertain mutation; reconcile it first.' }
     $request = ConvertFrom-Json $operation.requestJson -AsHashtable -Depth 100 -DateKind String
+    if ($request.kind -ceq 'issueWorkflow') { return (Invoke-JiraIssueWorkflow $Context $Binding $StatePath $operation $request) }
+    if ($operation.status -ne 'prepared') { throw 'Operation is not prepared. Do not resend an uncertain mutation; reconcile it first.' }
     $resource = $null
     switch ($request.kind) {
         'worklog' {
@@ -389,6 +393,7 @@ function Sync-JiraOperation {
     if ($operation.status -eq 'completed') { return $operation }
     if ($operation.status -notin @('sending', 'unknown')) { throw 'Only uncertain operations need reconciliation.' }
     $request = ConvertFrom-Json $operation.requestJson -AsHashtable -Depth 100 -DateKind String
+    if ($request.kind -ceq 'issueWorkflow') { return (Sync-JiraIssueWorkflow $Context $Binding $StatePath $operation $request $ResultIssueKey) }
     $operation.status = 'unknown'
     Save-JiraOperation $StatePath $operation
     switch ($request.kind) {
@@ -434,4 +439,4 @@ function Sync-JiraOperation {
     return $operation
 }
 
-Export-ModuleMember -Function Get-JiraCatalog, Save-JiraIssueAttachments, Get-JiraIssueBundle, New-JiraProposal, Invoke-JiraConfirmedWorklog, Assert-JiraOperationOwner, Invoke-JiraApprovedOperation, Sync-JiraOperation
+Export-ModuleMember -Function Get-JiraCatalog, Save-JiraIssueAttachments, Get-JiraIssueBundle, New-JiraProposal, Invoke-JiraConfirmedWorklog, Assert-JiraOperationOwner, Invoke-JiraApprovedOperation, Sync-JiraOperation, Assert-JiraInputKeys, Assert-JiraIssueScope, Assert-JiraCreatePayload, Complete-JiraOperation

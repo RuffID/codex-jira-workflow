@@ -34,9 +34,11 @@ function Assert-JiraResource {
     $parts = $Resource.Split('?', 2)
     $path = $parts[0]
     $allowed = if ($Method -eq 'GET') {
-        $path -cmatch '^(myself|project/search|issue/[A-Z][A-Z0-9_]*-[1-9][0-9]*(/(comment|worklog|transitions|properties/codex\.operation))?|project/[A-Z][A-Z0-9_]*(/statuses)?|issue/createmeta/[A-Z][A-Z0-9_]*/issuetypes(/[0-9]+)?|attachment/content/[0-9]+)$'
+        $path -cmatch '^(myself|project/search|issueLinkType|attachment/meta|issue/[A-Z][A-Z0-9_]*-[1-9][0-9]*(/(comment|worklog|transitions|properties/codex\.operation))?|project/[A-Z][A-Z0-9_]*(/statuses)?|issue/createmeta/[A-Z][A-Z0-9_]*/issuetypes(/[0-9]+)?|attachment/content/[0-9]+)$'
     } elseif ($Method -eq 'POST') {
-        $path -cmatch '^(issue|issue/[A-Z][A-Z0-9_]*-[1-9][0-9]*/(worklog|transitions))$'
+        $path -cmatch '^(issue|issueLink|issue/[A-Z][A-Z0-9_]*-[1-9][0-9]*/(worklog|transitions|comment|attachments))$'
+    } elseif ($Method -eq 'PUT') {
+        $path -cmatch '^issue/[A-Z][A-Z0-9_]*-[1-9][0-9]*$'
     } else { $false }
     if (-not $allowed -or $Resource.Contains('#') -or $Resource.Contains('\') -or $Resource -match '[\r\n]') { throw 'HTTP resource is outside the client allowlist.' }
 }
@@ -54,7 +56,14 @@ function Send-JiraHttp {
     Assert-JiraResource $Method $Resource
     $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::new($Method), ($Context.apiBase + $Resource))
     if (-not $Stream) { [void]$request.Headers.TryAddWithoutValidation('Accept', 'application/json') }
-    if ($null -ne $Body) {
+    if ($Body -is [Net.Http.MultipartFormDataContent]) {
+        if ($Method -cne 'POST' -or $Resource -cnotmatch '^issue/[A-Z][A-Z0-9_]*-[1-9][0-9]*/attachments$') { $request.Dispose(); throw 'Multipart content is only supported for issue attachments.' }
+        $request.Content = $Body
+        [void]$request.Headers.TryAddWithoutValidation('X-Atlassian-Token', 'no-check')
+    } elseif ($null -ne $Body) {
+        if ($Method -ceq 'PUT' -and ($Body -isnot [Collections.IDictionary] -or $Body.Count -ne 1 -or -not $Body.Contains('fields') -or $Body.fields -isnot [Collections.IDictionary] -or $Body.fields.Count -ne 1 -or -not $Body.fields.Contains('description'))) {
+            $request.Dispose(); throw 'Issue editing is limited to the reviewed description.'
+        }
         $request.Content = [Net.Http.StringContent]::new((ConvertTo-Json -InputObject $Body -Depth 100 -Compress), [Text.Encoding]::UTF8, 'application/json')
     }
     try {
@@ -75,11 +84,12 @@ function Invoke-JiraJson {
     param([Parameter(Mandatory)][System.Collections.IDictionary]$Context, [Parameter(Mandatory)][string]$Method, [Parameter(Mandatory)][string]$Resource, $Body = $null)
     $response = Send-JiraHttp $Context $Method $Resource $Body
     try {
-        if ([int]$response.StatusCode -eq 204) { return $null }
+        if ([int]$response.StatusCode -eq 204 -or $response.Content.Headers.ContentLength -eq 0) { return $null }
         try {
             $cts = [Threading.CancellationTokenSource]::new([timespan]::FromSeconds(60))
             try { $text = $response.Content.ReadAsStringAsync($cts.Token).GetAwaiter().GetResult() }
             finally { $cts.Dispose() }
+            if ([string]::IsNullOrWhiteSpace($text)) { return $null }
             $parsed = ConvertFrom-Json -InputObject $text -AsHashtable -Depth 100 -DateKind String -NoEnumerate -ErrorAction Stop
             return ,$parsed
         }
@@ -215,4 +225,44 @@ function Save-JiraAttachmentContent {
     }
 }
 
-Export-ModuleMember -Function New-JiraContext, Invoke-JiraJson, Get-JiraPagedItems, Get-JiraProjects, Get-JiraIssue, Get-JiraComments, Get-JiraWorklogs, Get-JiraTransitions, Get-JiraCreateTypes, Get-JiraCreateFields, ConvertTo-JiraDocument, ConvertFrom-JiraDocument, Save-JiraAttachmentContent
+function Send-JiraAttachment {
+    param($Context, [string]$IssueKey, [Collections.IDictionary]$File)
+    # Hold a read-only handle from hash verification through transmission.
+    $stream = [IO.File]::Open($File.path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $form = [Net.Http.MultipartFormDataContent]::new()
+    try {
+        $digest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()
+        if ($stream.Length -ne [long]$File.size -or $digest -cne $File.sha256) { throw 'Upload file changed after preparation; no attachment was sent.' }
+        $stream.Position = 0
+        $part = [Net.Http.StreamContent]::new($stream)
+        $part.Headers.ContentType = [Net.Http.Headers.MediaTypeHeaderValue]::new('application/octet-stream')
+        $form.Add($part, 'file', [string]$File.filename)
+        return ,(Invoke-JiraJson $Context 'POST' "issue/$IssueKey/attachments" $form)
+    }
+    finally { $form.Dispose(); $stream.Dispose() }
+}
+
+function Get-JiraAttachmentHash {
+    param($Context, [string]$AttachmentId, [long]$ExpectedSize)
+    if ($AttachmentId -cnotmatch '^[0-9]+$' -or $ExpectedSize -lt 0) { throw 'Invalid attachment metadata.' }
+    $response = Send-JiraHttp $Context 'GET' "attachment/content/${AttachmentId}?redirect=false" $null -Stream
+    $cts = [Threading.CancellationTokenSource]::new([timespan]::FromMinutes(5))
+    $digest = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    $stream = $null
+    try {
+        if ([int]$response.StatusCode -ne 200) { throw 'Attachment response is not a complete file.' }
+        $stream = $response.Content.ReadAsStreamAsync($cts.Token).GetAwaiter().GetResult()
+        $buffer = [byte[]]::new(65536)
+        $size = 0L
+        while (($read = $stream.ReadAsync($buffer, 0, $buffer.Length, $cts.Token).GetAwaiter().GetResult()) -gt 0) {
+            $size += $read
+            if ($size -gt $ExpectedSize) { throw 'Attachment size changed during verification.' }
+            $digest.AppendData($buffer, 0, $read)
+        }
+        if ($size -ne $ExpectedSize) { throw 'Attachment content is incomplete.' }
+        return [Convert]::ToHexString($digest.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally { if ($null -ne $stream) { $stream.Dispose() }; $digest.Dispose(); $cts.Dispose(); $response.Dispose() }
+}
+
+Export-ModuleMember -Function New-JiraContext, Invoke-JiraJson, Get-JiraPagedItems, Get-JiraProjects, Get-JiraIssue, Get-JiraComments, Get-JiraWorklogs, Get-JiraTransitions, Get-JiraCreateTypes, Get-JiraCreateFields, ConvertTo-JiraDocument, ConvertFrom-JiraDocument, Save-JiraAttachmentContent, Send-JiraAttachment, Get-JiraAttachmentHash
