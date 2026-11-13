@@ -6,4 +6,6 @@ PowerShell 7.5+ entry point for the approved Jira workflow. `jira.ps1` validates
 
 The repository root (parent of `client/`) owns `config.json` and runtime `data/`. Resolve it relative to the entry point; do not fall back to AppData or another checkout.
 
+`LogWorklog` requires a caller-supplied stable operation UUID, payload and explicit confirmation before authentication. It performs immutable preparation and approved execution in one session under the account lock. Existing prepared proposals still use `Execute` with their reviewed hash; uncertain operations require reconciliation.
+
 Do not execute this client, its modules as scripts, or tests without the applicable user permission. Syntax parsing is not execution. Tests must use a fake transport and isolated storage, never Jira, actual credentials or the production configuration.

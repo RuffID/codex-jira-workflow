@@ -1,7 +1,7 @@
 #requires -Version 7.5
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('GetProjects', 'GetIssue', 'DownloadAttachments', 'GetTransitions', 'GetCatalog', 'GetCreateFields', 'PrepareWorklog', 'PrepareTransition', 'PrepareIssue', 'Execute', 'Reconcile', 'GetOperation', 'Cancel')][string]$Command,
+    [Parameter(Mandatory)][ValidateSet('GetProjects', 'GetIssue', 'DownloadAttachments', 'GetTransitions', 'GetCatalog', 'GetCreateFields', 'LogWorklog', 'PrepareWorklog', 'PrepareTransition', 'PrepareIssue', 'Execute', 'Reconcile', 'GetOperation', 'Cancel')][string]$Command,
     [string]$RepositoryPath,
     [string]$IssueKey,
     [string]$ProjectKey,
@@ -48,8 +48,14 @@ try {
     if ($ResultIssueKey) { Assert-JiraAllowedIssue $binding $ResultIssueKey }
     if ($Command -in @('GetIssue', 'DownloadAttachments', 'GetTransitions') -and -not $IssueKey) { throw 'IssueKey is required.' }
     if ($Command -eq 'GetCreateFields' -and (-not $ProjectKey -or -not $IssueTypeId)) { throw 'ProjectKey and IssueTypeId are required.' }
-    if ($Command -in @('PrepareWorklog', 'PrepareTransition', 'PrepareIssue') -and -not $PayloadPath) { throw 'PayloadPath is required.' }
-    if ($Command -in @('Execute', 'Reconcile', 'GetOperation', 'Cancel') -and -not $OperationId) { throw 'OperationId is required.' }
+    if ($Command -in @('LogWorklog', 'PrepareWorklog', 'PrepareTransition', 'PrepareIssue') -and -not $PayloadPath) { throw 'PayloadPath is required.' }
+    if ($Command -in @('LogWorklog', 'Execute', 'Reconcile', 'GetOperation', 'Cancel') -and -not $OperationId) { throw 'OperationId is required.' }
+    if ($Command -eq 'LogWorklog') {
+        if (-not $Confirmed) { throw 'LogWorklog requires explicit confirmation.' }
+        $parsedOperationId = [guid]::Empty
+        if (-not [guid]::TryParseExact($OperationId, 'D', [ref]$parsedOperationId)) { throw 'Operation ID must be a full UUID.' }
+        $OperationId = $parsedOperationId.ToString('D')
+    }
     if ($Command -eq 'Execute' -and (-not $Confirmed -or -not $RequestHash)) { throw 'Execute requires Confirmed and the reviewed RequestHash.' }
     if ($ApprovedLargeAttachmentIds.Count -gt 0 -and $Command -ne 'DownloadAttachments' -and -not ($Command -eq 'GetIssue' -and $WithAttachments)) { throw 'Large-file approval is only valid for attachment downloads.' }
     Import-Module (Join-Path $PSScriptRoot 'modules/JiraApi.psm1') -Force -DisableNameChecking
@@ -72,18 +78,19 @@ try {
     $result = switch ($Command) {
         'GetIssue' { Get-JiraIssueBundle $context $binding $statePath $IssueKey -WithAttachments:$WithAttachments -AttachmentIds $AttachmentIds -ApprovedLargeAttachmentIds $ApprovedLargeAttachmentIds }
         'DownloadAttachments' {
-            $issue = Get-JiraIssue $context $IssueKey
+            $issue = Get-JiraIssue $context $IssueKey -Fields @('project', 'attachment')
             if ($issue.key -cne $IssueKey) { throw 'Jira issue key changed; review it before proceeding.' }
             Save-JiraIssueAttachments $context $binding $statePath $issue $AttachmentIds $ApprovedLargeAttachmentIds
         }
         'GetTransitions' {
-            $issue = Get-JiraIssue $context $IssueKey
+            $issue = Get-JiraIssue $context $IssueKey -Fields @('project', 'status')
             if ($issue.key -cne $IssueKey) { throw 'Jira issue key changed; review it before proceeding.' }
             Assert-JiraAllowedProject $binding $issue.fields.project.key
             @{ issueKey = $IssueKey; currentStatus = $issue.fields.status; transitions = Get-JiraTransitions $context $IssueKey }
         }
         'GetCatalog' { Get-JiraCatalog $context $binding $statePath -Refresh:$Refresh }
         'GetCreateFields' { @{ projectKey = $ProjectKey; issueTypeId = $IssueTypeId; fields = Get-JiraCreateFields $context $ProjectKey $IssueTypeId } }
+        'LogWorklog' { Invoke-JiraConfirmedWorklog $context $binding $statePath $OperationId $inputData -Confirmed:$Confirmed }
         'PrepareWorklog' { New-JiraProposal $context $binding $statePath 'worklog' $inputData }
         'PrepareTransition' { New-JiraProposal $context $binding $statePath 'transition' $inputData }
         'PrepareIssue' { New-JiraProposal $context $binding $statePath 'create' $inputData }

@@ -114,8 +114,9 @@ function Get-JiraProjects {
 }
 
 function Get-JiraIssue {
-    param([Parameter(Mandatory)][System.Collections.IDictionary]$Context, [Parameter(Mandatory)][string]$IssueKey)
-    return (Invoke-JiraJson $Context 'GET' "issue/${IssueKey}?fields=*all")
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Context, [Parameter(Mandatory)][string]$IssueKey, [ValidateNotNullOrEmpty()][string[]]$Fields = @('*all'))
+    $selection = [uri]::EscapeDataString(($Fields -join ','))
+    return (Invoke-JiraJson $Context 'GET' "issue/${IssueKey}?fields=$selection")
 }
 
 function Get-JiraComments {

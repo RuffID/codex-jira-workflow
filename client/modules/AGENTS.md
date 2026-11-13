@@ -7,6 +7,8 @@
 
 Project discovery uses only GET `myself` and paginated GET `project/search`, returning IDs, keys and names. It must not write configuration, cache or operation records; project discovery grants no permission to use the returned projects for task operations.
 
-An approved mutation authorizes only the reviewed operation. Keep preparation and execution separate, preserve the request hash, and revalidate current Jira permissions/workflow at execution.
+An approved mutation authorizes only the reviewed operation. Preserve immutable preparation, the request hash, and current Jira permissions/workflow validation at execution. `LogWorklog` combines these stages within one command only for an already confirmed worklog; its caller supplies a stable UUID before sending, and retries must reuse that UUID and payload. Existing operations cannot be overwritten or uncertain mutations resent.
+
+Issue validation requests only the fields needed by the caller. Full issue inspection keeps all fields and paginated comments.
 
 Attachment caching is per issue/attachment ID and verifies metadata, size and SHA-256 before reuse. New content downloads over 500,000,000 bytes require explicit approval for the selected ID; do not treat an unrelated file approval as blanket consent.

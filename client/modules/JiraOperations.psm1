@@ -191,41 +191,55 @@ function Assert-JiraCreatePayload {
     if ($Fields.Contains('parent')) {
         $parentKey = [string]$Fields['parent']['key']
         Assert-JiraAllowedIssue $Binding $parentKey
-        $parent = Get-JiraIssue $Context $parentKey
+        $parent = Get-JiraIssue $Context $parentKey -Fields @('project')
         Assert-JiraIssueScope $Binding $parentKey $parent
         if ($parent.fields.project.key -cne $projectKey) { throw 'Parent must belong to the selected project.' }
     }
 }
 
+function New-JiraWorklogData {
+    param($Binding, [Collections.IDictionary]$InputData, [string]$OperationId)
+    Assert-JiraInputKeys $InputData @('issueKey', 'timeSpentSeconds', 'started', 'description')
+    $key = [string]$InputData['issueKey']
+    Assert-JiraAllowedIssue $Binding $key
+    if ($InputData['timeSpentSeconds'] -isnot [long] -and $InputData['timeSpentSeconds'] -isnot [int]) { throw 'timeSpentSeconds must be an integer.' }
+    $seconds = [long]$InputData.timeSpentSeconds
+    if ($seconds -le 0 -or $seconds -gt [int]::MaxValue) { throw 'timeSpentSeconds is outside the supported range.' }
+    $started = Get-JiraTimestamp ([string]$InputData['started'])
+    $description = [string]$InputData['description']
+    if ([string]::IsNullOrWhiteSpace($description)) { throw 'Work description is required.' }
+    $comment = "[Codex] $description`nОперация: $OperationId"
+    $formatted = $started.ToString("yyyy-MM-dd'T'HH:mm:ss.fffzzz", [cultureinfo]::InvariantCulture) -replace '([+-][0-9]{2}):([0-9]{2})$', '$1$2'
+    return @{
+        issueKey = $key
+        body = @{ started = $formatted; timeSpentSeconds = $seconds; comment = ConvertTo-JiraDocument $comment }
+        preview = @{ issueKey = $key; seconds = $seconds; started = $started.ToString('o'); comment = $comment; adjustEstimate = 'auto' }
+    }
+}
+
 function New-JiraProposal {
-    param($Context, $Binding, [string]$StatePath, [ValidateSet('worklog', 'transition', 'create')][string]$Kind, [Collections.IDictionary]$InputData)
-    $id = [guid]::NewGuid().ToString('D')
+    param($Context, $Binding, [string]$StatePath, [ValidateSet('worklog', 'transition', 'create')][string]$Kind, [Collections.IDictionary]$InputData, [string]$OperationId = '')
+    $id = if ($OperationId) { ([guid]::ParseExact($OperationId, 'D')).ToString('D') } else { [guid]::NewGuid().ToString('D') }
+    $path = Get-JiraOperationPath $StatePath $id
+    Assert-JiraPlainPath $path
+    if ([IO.File]::Exists($path)) { throw 'Operation already exists; do not overwrite its journal record.' }
     $request = @{ kind = $Kind; issueKey = $null; body = $null; targetStatusId = $null; fromStatusId = $null }
     $preview = @{}
     switch ($Kind) {
         'worklog' {
-            Assert-JiraInputKeys $InputData @('issueKey', 'timeSpentSeconds', 'started', 'description')
-            $key = [string]$InputData['issueKey']
-            Assert-JiraAllowedIssue $Binding $key
-            $issue = Get-JiraIssue $Context $key
-            Assert-JiraIssueScope $Binding $key $issue
-            if ($InputData['timeSpentSeconds'] -isnot [long] -and $InputData['timeSpentSeconds'] -isnot [int]) { throw 'timeSpentSeconds must be an integer.' }
-            $seconds = [long]$InputData.timeSpentSeconds
-            if ($seconds -le 0 -or $seconds -gt [int]::MaxValue) { throw 'timeSpentSeconds is outside the supported range.' }
-            $started = Get-JiraTimestamp ([string]$InputData['started'])
-            $description = [string]$InputData['description']
-            if ([string]::IsNullOrWhiteSpace($description)) { throw 'Work description is required.' }
-            $comment = "[Codex] $description`nОперация: $id"
-            $formatted = $started.ToString("yyyy-MM-dd'T'HH:mm:ss.fffzzz", [cultureinfo]::InvariantCulture) -replace '([+-][0-9]{2}):([0-9]{2})$', '$1$2'
-            $request.issueKey = $key
-            $request.body = @{ started = $formatted; timeSpentSeconds = $seconds; comment = ConvertTo-JiraDocument $comment }
-            $preview = @{ issueKey = $key; summary = $issue.fields.summary; seconds = $seconds; started = $started.ToString('o'); comment = $comment; adjustEstimate = 'auto' }
+            $worklog = New-JiraWorklogData $Binding $InputData $id
+            $issue = Get-JiraIssue $Context $worklog.issueKey -Fields @('project', 'summary')
+            Assert-JiraIssueScope $Binding $worklog.issueKey $issue
+            $request.issueKey = $worklog.issueKey
+            $request.body = $worklog.body
+            $preview = $worklog.preview
+            $preview.summary = $issue.fields.summary
         }
         'transition' {
             Assert-JiraInputKeys $InputData @('issueKey', 'transitionId', 'fields')
             $key = [string]$InputData['issueKey']
             Assert-JiraAllowedIssue $Binding $key
-            $issue = Get-JiraIssue $Context $key
+            $issue = Get-JiraIssue $Context $key -Fields @('project', 'summary', 'status')
             Assert-JiraIssueScope $Binding $key $issue
             $transitions = Get-JiraTransitions $Context $key
             $selected = @($transitions | Where-Object { [string]$_['id'] -ceq [string]$InputData['transitionId'] })
@@ -259,6 +273,28 @@ function New-JiraProposal {
     return $operation
 }
 
+function Invoke-JiraConfirmedWorklog {
+    param($Context, $Binding, [string]$StatePath, [string]$OperationId, [Collections.IDictionary]$InputData, [switch]$Confirmed)
+    if (-not $Confirmed) { throw 'Execution requires explicit confirmation of the worklog.' }
+    $id = ([guid]::ParseExact($OperationId, 'D')).ToString('D')
+    $path = Get-JiraOperationPath $StatePath $id
+    Assert-JiraPlainPath $path
+    if ([IO.File]::Exists($path)) {
+        $operation = Read-JiraOperation $StatePath $id
+        Assert-JiraOperationOwner $Context $Binding $operation
+        $expected = New-JiraWorklogData $Binding $InputData $id
+        $request = ConvertFrom-Json $operation.requestJson -AsHashtable -Depth 100 -DateKind String
+        if ($request.kind -cne 'worklog' -or $request.issueKey -cne $expected.issueKey -or
+            $request.body.started -cne $expected.body.started -or $request.body.timeSpentSeconds -ne $expected.body.timeSpentSeconds -or
+            (ConvertFrom-JiraDocument $request.body.comment) -cne (ConvertFrom-JiraDocument $expected.body.comment)) {
+            throw 'Operation ID belongs to different parameters; the stored request was not changed.'
+        }
+    } else {
+        $operation = New-JiraProposal $Context $Binding $StatePath 'worklog' $InputData -OperationId $id
+    }
+    return (Invoke-JiraApprovedOperation $Context $Binding $StatePath $id $operation.requestHash -Confirmed)
+}
+
 function Assert-JiraOperationOwner {
     param($Context, $Binding, $Operation)
     if ($Operation.siteIdentity -cne $Context.siteIdentity -or $Operation.accountId -cne $Context.accountId -or -not $Operation.repositoryPath.Equals($Binding.path, [StringComparison]::OrdinalIgnoreCase)) {
@@ -288,13 +324,13 @@ function Invoke-JiraApprovedOperation {
     switch ($request.kind) {
         'worklog' {
             Assert-JiraAllowedIssue $Binding $request.issueKey
-            $issue = Get-JiraIssue $Context $request.issueKey
+            $issue = Get-JiraIssue $Context $request.issueKey -Fields @('project')
             Assert-JiraIssueScope $Binding $request.issueKey $issue
             $resource = "issue/$($request.issueKey)/worklog?adjustEstimate=auto"
         }
         'transition' {
             Assert-JiraAllowedIssue $Binding $request.issueKey
-            $issue = Get-JiraIssue $Context $request.issueKey
+            $issue = Get-JiraIssue $Context $request.issueKey -Fields @('project', 'status')
             Assert-JiraIssueScope $Binding $request.issueKey $issue
             if ([string]$issue.fields.status.id -ceq $request.targetStatusId) {
                 return (Complete-JiraOperation $StatePath $operation @{ issueKey = $issue.key; mode = 'already-in-target-status' })
@@ -321,7 +357,7 @@ function Invoke-JiraApprovedOperation {
                 $result = @{ worklogId = [string]$response.id; issueKey = $request.issueKey; seconds = $request.body.timeSpentSeconds; url = "$($Context.siteUrl)/browse/$($request.issueKey)" }
             }
             'transition' {
-                $current = Get-JiraIssue $Context $request.issueKey
+                $current = Get-JiraIssue $Context $request.issueKey -Fields @('project', 'status')
                 Assert-JiraIssueScope $Binding $request.issueKey $current
                 if ([string]$current.fields.status.id -cne $request.targetStatusId) { throw 'Transition was accepted but target status could not be verified.' }
                 $result = @{ issueKey = $current.key; status = $current.fields.status.name; url = "$($Context.siteUrl)/browse/$($current.key)" }
@@ -358,7 +394,7 @@ function Sync-JiraOperation {
     switch ($request.kind) {
         'worklog' {
             Assert-JiraAllowedIssue $Binding $request.issueKey
-            $issue = Get-JiraIssue $Context $request.issueKey
+            $issue = Get-JiraIssue $Context $request.issueKey -Fields @('project')
             Assert-JiraIssueScope $Binding $request.issueKey $issue
             $expectedText = ConvertFrom-JiraDocument $request.body.comment
             $marker = "Операция: $OperationId"
@@ -375,7 +411,7 @@ function Sync-JiraOperation {
         }
         'transition' {
             Assert-JiraAllowedIssue $Binding $request.issueKey
-            $issue = Get-JiraIssue $Context $request.issueKey
+            $issue = Get-JiraIssue $Context $request.issueKey -Fields @('project', 'status')
             Assert-JiraIssueScope $Binding $request.issueKey $issue
             if ([string]$issue.fields.status.id -ceq $request.targetStatusId) {
                 return (Complete-JiraOperation $StatePath $operation @{ issueKey = $issue.key; mode = 'target-status-observed'; status = $issue.fields.status.name })
@@ -385,7 +421,7 @@ function Sync-JiraOperation {
         'create' {
             if (-not $ResultIssueKey) { throw 'Provide a candidate ResultIssueKey to verify the creation marker. No creation retry is allowed.' }
             Assert-JiraAllowedIssue $Binding $ResultIssueKey
-            $issue = Get-JiraIssue $Context $ResultIssueKey
+            $issue = Get-JiraIssue $Context $ResultIssueKey -Fields @('project')
             Assert-JiraIssueScope $Binding $ResultIssueKey $issue
             if ($issue.fields.project.key -cne $request.body.fields.project.key) { throw 'Candidate issue belongs to a different project.' }
             $property = Invoke-JiraJson $Context 'GET' "issue/$ResultIssueKey/properties/codex.operation"
@@ -398,4 +434,4 @@ function Sync-JiraOperation {
     return $operation
 }
 
-Export-ModuleMember -Function Get-JiraCatalog, Save-JiraIssueAttachments, Get-JiraIssueBundle, New-JiraProposal, Assert-JiraOperationOwner, Invoke-JiraApprovedOperation, Sync-JiraOperation
+Export-ModuleMember -Function Get-JiraCatalog, Save-JiraIssueAttachments, Get-JiraIssueBundle, New-JiraProposal, Invoke-JiraConfirmedWorklog, Assert-JiraOperationOwner, Invoke-JiraApprovedOperation, Sync-JiraOperation
