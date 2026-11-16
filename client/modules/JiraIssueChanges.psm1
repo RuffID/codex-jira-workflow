@@ -2,14 +2,18 @@
 Set-StrictMode -Version Latest
 
 function ConvertTo-JiraCanonicalValue {
-    param([AllowNull()]$Value)
+    param([AllowNull()]$Value, [switch]$NormalizeEmptyParagraphs)
     if ($Value -is [Collections.IDictionary]) {
         $ordered = [ordered]@{}
-        foreach ($key in @($Value.Keys | Sort-Object -CaseSensitive)) { $ordered[$key] = ConvertTo-JiraCanonicalValue $Value[$key] }
+        foreach ($key in @($Value.Keys | Sort-Object -CaseSensitive)) {
+            # Jira omits content: [] when returning an empty paragraph.
+            if ($NormalizeEmptyParagraphs -and $key -ceq 'content' -and $Value['type'] -ceq 'paragraph' -and $Value[$key] -is [array] -and $Value[$key].Count -eq 0) { continue }
+            $ordered[$key] = ConvertTo-JiraCanonicalValue $Value[$key] -NormalizeEmptyParagraphs:$NormalizeEmptyParagraphs
+        }
         return $ordered
     }
     if ($Value -is [array]) {
-        $items = @(foreach ($item in $Value) { ConvertTo-JiraCanonicalValue $item })
+        $items = @(foreach ($item in $Value) { ConvertTo-JiraCanonicalValue $item -NormalizeEmptyParagraphs:$NormalizeEmptyParagraphs })
         return ,$items
     }
     return $Value
@@ -18,6 +22,11 @@ function ConvertTo-JiraCanonicalValue {
 function Get-JiraValueHash {
     param([AllowNull()]$Value)
     return (Get-JiraHash (ConvertTo-Json -InputObject (ConvertTo-JiraCanonicalValue $Value) -Depth 100 -Compress))
+}
+
+function Get-JiraDescriptionHash {
+    param([AllowNull()]$Document)
+    return (Get-JiraHash (ConvertTo-Json -InputObject (ConvertTo-JiraCanonicalValue $Document -NormalizeEmptyParagraphs) -Depth 100 -Compress))
 }
 
 function Assert-JiraChangeDocument {
@@ -94,7 +103,7 @@ function Get-JiraPreparedLinks {
 }
 
 function New-JiraIssueWorkflowProposal {
-    param($Context, $Binding, [string]$StatePath, [ValidateSet('create', 'link', 'attachments')][string]$Kind, [Collections.IDictionary]$InputData, [string]$OperationId = '')
+    param($Context, $Binding, [string]$StatePath, [ValidateSet('create', 'link', 'attachments', 'description')][string]$Kind, [Collections.IDictionary]$InputData, [string]$OperationId = '')
     $id = if ($OperationId) { ([guid]::ParseExact($OperationId, 'D')).ToString('D') } else { [guid]::NewGuid().ToString('D') }
     $path = Get-JiraOperationPath $StatePath $id
     Assert-JiraPlainPath $path
@@ -103,6 +112,9 @@ function New-JiraIssueWorkflowProposal {
     $key = ''
     $baseDescription = $null
     $attachmentInput = $null
+    $files = @()
+    $placement = $null
+    $text = ''
     $links = @()
     $fields = $null
     switch ($Kind) {
@@ -135,10 +147,18 @@ function New-JiraIssueWorkflowProposal {
             $baseDescription = $issue.fields['description']
             $attachmentInput = $InputData
         }
+        'description' {
+            Assert-JiraInputKeys $InputData @('issueKey', 'text')
+            if ($InputData['text'] -isnot [string] -or [string]::IsNullOrWhiteSpace($InputData['text'])) { throw 'Description text must be a nonempty string.' }
+            $key = [string]$InputData['issueKey']
+            $issue = Get-JiraChangeIssue $Context $Binding $key -Fields @('project', 'description')
+            $baseDescription = $issue.fields['description']
+            Assert-JiraChangeDocument $baseDescription
+            $placement = 'description'
+            $text = $InputData.text
+            $steps.Add(@{ kind = 'description'; text = $text; baseDescription = $baseDescription })
+        }
     }
-    $files = @()
-    $placement = $null
-    $text = ''
     if ($null -ne $attachmentInput) {
         $files = Get-JiraUploadFiles $attachmentInput
         Assert-JiraUploadSettings $Context $files
@@ -160,7 +180,7 @@ function New-JiraIssueWorkflowProposal {
         schemaVersion = 1; id = $id; status = 'prepared'; createdAt = [datetimeoffset]::UtcNow.ToString('o'); completedAt = $null
         repositoryPath = $Binding.path; siteIdentity = $Context.siteIdentity; accountId = $Context.accountId
         requestJson = $requestJson; requestHash = Get-JiraHash $requestJson
-        preview = @{ issueKey = $key; fields = $fields; links = $links; files = $files; placement = $placement; text = $text; rendering = 'attachment-links'; inlineImages = $false; descriptionMode = 'append'; steps = @($steps | ForEach-Object { $_.kind }) }
+        preview = @{ issueKey = $key; fields = $fields; links = $links; files = $files; placement = $placement; text = $text; rendering = $(if ($Kind -ceq 'description') { 'text' } else { 'attachment-links' }); inlineImages = $false; descriptionMode = 'append'; steps = @($steps | ForEach-Object { $_.kind }) }
         progress = @($steps | ForEach-Object { @{ status = 'pending'; result = $null; beforeAttachmentIds = @(); expectedDocument = $null } })
         result = $null
     }
@@ -217,7 +237,8 @@ function Set-JiraWorkflowStepComplete {
 function Complete-JiraWorkflow {
     param($Context, [string]$StatePath, $Operation, $Request)
     $key = Get-JiraWorkflowKey $Request $Operation
-    return (Complete-JiraOperation $StatePath $Operation @{ issueKey = $key; url = "$($Context.siteUrl)/browse/$key"; steps = $Operation.progress; rendering = 'attachment-links'; inlineImages = $false })
+    $rendering = if ($Request.steps.Count -eq 1 -and $Request.steps[0].kind -ceq 'description') { 'text' } else { 'attachment-links' }
+    return (Complete-JiraOperation $StatePath $Operation @{ issueKey = $key; url = "$($Context.siteUrl)/browse/$key"; steps = $Operation.progress; rendering = $rendering; inlineImages = $false })
 }
 
 function Invoke-JiraIssueWorkflow {
@@ -231,7 +252,7 @@ function Invoke-JiraIssueWorkflow {
         $current = Get-JiraChangeIssue $Context $Binding $Request.issueKey
         for ($i = 0; $i -lt $Request.steps.Count; $i++) {
             $step = $Request.steps[$i]
-            if ($step.kind -ceq 'description' -and $Operation.progress[$i].status -cne 'completed' -and (Get-JiraValueHash $current.fields['description']) -cne (Get-JiraValueHash $step.baseDescription)) { throw 'Description changed after preparation; no further mutation was sent. Prepare and review a new append operation.' }
+            if ($step.kind -ceq 'description' -and $Operation.progress[$i].status -cne 'completed' -and (Get-JiraDescriptionHash $current.fields['description']) -cne (Get-JiraDescriptionHash $step.baseDescription)) { throw 'Description changed after preparation; no further mutation was sent. Prepare and review a new append operation.' }
         }
     }
     foreach ($step in $Request.steps) {
@@ -277,7 +298,7 @@ function Invoke-JiraIssueWorkflow {
             }
             'description' {
                 $issue = Get-JiraChangeIssue $Context $Binding $key -Fields @('project', 'description')
-                if ((Get-JiraValueHash $issue.fields['description']) -cne (Get-JiraValueHash $step.baseDescription)) { throw 'Description changed after preparation; existing content was not overwritten.' }
+                if ((Get-JiraDescriptionHash $issue.fields['description']) -cne (Get-JiraDescriptionHash $step.baseDescription)) { throw 'Description changed after preparation; existing content was not overwritten.' }
                 $progress.expectedDocument = New-JiraAttachmentDocument $Context $Request $Operation $step
                 $body = @{ fields = @{ description = $progress.expectedDocument } }
                 $method = 'PUT'; $resource = "issue/$key"
@@ -313,7 +334,7 @@ function Invoke-JiraIssueWorkflow {
                 }
                 'description' {
                     $issue = Get-JiraChangeIssue $Context $Binding $key -Fields @('project', 'description')
-                    if ((Get-JiraValueHash $issue.fields['description']) -cne (Get-JiraValueHash $progress.expectedDocument)) { throw 'The expected description was not observed after the update.' }
+                    if ((Get-JiraDescriptionHash $issue.fields['description']) -cne (Get-JiraDescriptionHash $progress.expectedDocument)) { throw 'The expected description was not observed after the update.' }
                     $result = @{ mode = 'description-observed' }
                 }
             }
@@ -356,7 +377,7 @@ function Sync-JiraIssueWorkflow {
         }
         'description' {
             $issue = Get-JiraChangeIssue $Context $Binding $key -Fields @('project', 'description')
-            if ((Get-JiraValueHash $issue.fields['description']) -ceq (Get-JiraValueHash $progress.expectedDocument)) { $result = @{ mode = 'description-observed' } }
+            if ((Get-JiraDescriptionHash $issue.fields['description']) -ceq (Get-JiraDescriptionHash $progress.expectedDocument)) { $result = @{ mode = 'description-observed' } }
         }
         'comment' {
             [void](Get-JiraChangeIssue $Context $Binding $key -Fields @('project'))
