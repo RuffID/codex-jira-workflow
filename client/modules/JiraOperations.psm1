@@ -218,8 +218,8 @@ function New-JiraWorklogData {
 }
 
 function New-JiraProposal {
-    param($Context, $Binding, [string]$StatePath, [ValidateSet('worklog', 'transition', 'create', 'link', 'attachments', 'description')][string]$Kind, [Collections.IDictionary]$InputData, [string]$OperationId = '')
-    if ($Kind -in @('link', 'attachments', 'description') -or ($Kind -eq 'create' -and ($InputData.Contains('links') -or $InputData.Contains('attachments')))) {
+    param($Context, $Binding, [string]$StatePath, [ValidateSet('worklog', 'transition', 'create', 'link', 'attachments', 'description', 'comment')][string]$Kind, [Collections.IDictionary]$InputData, [string]$OperationId = '')
+    if ($Kind -in @('link', 'attachments', 'description', 'comment') -or ($Kind -eq 'create' -and ($InputData.Contains('links') -or $InputData.Contains('attachments')))) {
         return (New-JiraIssueWorkflowProposal $Context $Binding $StatePath $Kind $InputData -OperationId $OperationId)
     }
     $id = if ($OperationId) { ([guid]::ParseExact($OperationId, 'D')).ToString('D') } else { [guid]::NewGuid().ToString('D') }

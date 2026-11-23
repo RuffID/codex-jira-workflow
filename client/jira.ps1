@@ -1,7 +1,7 @@
 #requires -Version 7.5
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('GetProjects', 'GetIssue', 'DownloadAttachments', 'GetTransitions', 'GetCatalog', 'GetCreateFields', 'GetLinkTypes', 'LogWorklog', 'PrepareWorklog', 'PrepareTransition', 'PrepareIssue', 'PrepareLink', 'PrepareAttachments', 'PrepareDescription', 'Execute', 'Reconcile', 'GetOperation', 'Cancel')][string]$Command,
+    [Parameter(Mandatory)][ValidateSet('GetProjects', 'GetIssue', 'DownloadAttachments', 'GetTransitions', 'GetCatalog', 'GetCreateFields', 'GetLinkTypes', 'LogWorklog', 'PrepareWorklog', 'PrepareTransition', 'PrepareIssue', 'PrepareLink', 'PrepareAttachments', 'PrepareDescription', 'PrepareComment', 'Execute', 'Reconcile', 'GetOperation', 'Cancel')][string]$Command,
     [string]$RepositoryPath,
     [string]$IssueKey,
     [string]$ProjectKey,
@@ -48,7 +48,7 @@ try {
     if ($ResultIssueKey) { Assert-JiraAllowedIssue $binding $ResultIssueKey }
     if ($Command -in @('GetIssue', 'DownloadAttachments', 'GetTransitions') -and -not $IssueKey) { throw 'IssueKey is required.' }
     if ($Command -eq 'GetCreateFields' -and (-not $ProjectKey -or -not $IssueTypeId)) { throw 'ProjectKey and IssueTypeId are required.' }
-    if ($Command -in @('LogWorklog', 'PrepareWorklog', 'PrepareTransition', 'PrepareIssue', 'PrepareLink', 'PrepareAttachments', 'PrepareDescription') -and -not $PayloadPath) { throw 'PayloadPath is required.' }
+    if ($Command -in @('LogWorklog', 'PrepareWorklog', 'PrepareTransition', 'PrepareIssue', 'PrepareLink', 'PrepareAttachments', 'PrepareDescription', 'PrepareComment') -and -not $PayloadPath) { throw 'PayloadPath is required.' }
     if ($Command -in @('LogWorklog', 'Execute', 'Reconcile', 'GetOperation', 'Cancel') -and -not $OperationId) { throw 'OperationId is required.' }
     if ($Command -eq 'LogWorklog') {
         if (-not $Confirmed) { throw 'LogWorklog requires explicit confirmation.' }
@@ -102,6 +102,7 @@ try {
         'PrepareLink' { New-JiraProposal $context $binding $statePath 'link' $inputData }
         'PrepareAttachments' { New-JiraProposal $context $binding $statePath 'attachments' $inputData }
         'PrepareDescription' { New-JiraProposal $context $binding $statePath 'description' $inputData }
+        'PrepareComment' { New-JiraProposal $context $binding $statePath 'comment' $inputData }
         'Execute' { Invoke-JiraApprovedOperation $context $binding $statePath $OperationId $RequestHash -Confirmed:$Confirmed }
         'Reconcile' { Sync-JiraOperation $context $binding $statePath $OperationId $ResultIssueKey }
         'GetOperation' {

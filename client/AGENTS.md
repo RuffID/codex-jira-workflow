@@ -13,3 +13,5 @@ Do not execute this client, its modules as scripts, or tests without the applica
 Issue creation can include reviewed links and attachments. `PrepareLink` and `PrepareAttachments` also work on existing issues. A workflow records each mutation separately; `partial` retains completed steps, and `unknown` requires reconciliation before continuation. File rendering is explicitly attachment links, never an unverified inline-media fallback. Existing description updates append ADF nodes and check for changes since preparation.
 
 `PrepareDescription` accepts only `issueKey` and nonempty string `text`, preparing a text-only append without attachments or comments. Execute it through the same confirmed UUID/hash workflow; retain rich ADF, recheck the description baseline before PUT, and reconcile uncertain outcomes without resending.
+
+`PrepareComment` accepts only `issueKey` and nonempty string `text`, preparing one new comment without attachments or description changes. Reuse the journalled comment step, operation marker and confirmed UUID/hash execution; reconcile by exact content and author without resending uncertain comments.

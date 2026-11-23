@@ -20,8 +20,8 @@ function ConvertTo-JiraCanonicalValue {
 }
 
 function Get-JiraValueHash {
-    param([AllowNull()]$Value)
-    return (Get-JiraHash (ConvertTo-Json -InputObject (ConvertTo-JiraCanonicalValue $Value) -Depth 100 -Compress))
+    param([AllowNull()]$Value, [switch]$NormalizeEmptyParagraphs)
+    return (Get-JiraHash (ConvertTo-Json -InputObject (ConvertTo-JiraCanonicalValue $Value -NormalizeEmptyParagraphs:$NormalizeEmptyParagraphs) -Depth 100 -Compress))
 }
 
 function Get-JiraDescriptionHash {
@@ -103,7 +103,7 @@ function Get-JiraPreparedLinks {
 }
 
 function New-JiraIssueWorkflowProposal {
-    param($Context, $Binding, [string]$StatePath, [ValidateSet('create', 'link', 'attachments', 'description')][string]$Kind, [Collections.IDictionary]$InputData, [string]$OperationId = '')
+    param($Context, $Binding, [string]$StatePath, [ValidateSet('create', 'link', 'attachments', 'description', 'comment')][string]$Kind, [Collections.IDictionary]$InputData, [string]$OperationId = '')
     $id = if ($OperationId) { ([guid]::ParseExact($OperationId, 'D')).ToString('D') } else { [guid]::NewGuid().ToString('D') }
     $path = Get-JiraOperationPath $StatePath $id
     Assert-JiraPlainPath $path
@@ -158,6 +158,15 @@ function New-JiraIssueWorkflowProposal {
             $text = $InputData.text
             $steps.Add(@{ kind = 'description'; text = $text; baseDescription = $baseDescription })
         }
+        'comment' {
+            Assert-JiraInputKeys $InputData @('issueKey', 'text')
+            if ($InputData['text'] -isnot [string] -or [string]::IsNullOrWhiteSpace($InputData['text'])) { throw 'Comment text must be a nonempty string.' }
+            $key = [string]$InputData['issueKey']
+            [void](Get-JiraChangeIssue $Context $Binding $key -Fields @('project'))
+            $placement = 'comment'
+            $text = $InputData.text
+            $steps.Add(@{ kind = 'comment'; text = $text })
+        }
     }
     if ($null -ne $attachmentInput) {
         $files = Get-JiraUploadFiles $attachmentInput
@@ -180,7 +189,7 @@ function New-JiraIssueWorkflowProposal {
         schemaVersion = 1; id = $id; status = 'prepared'; createdAt = [datetimeoffset]::UtcNow.ToString('o'); completedAt = $null
         repositoryPath = $Binding.path; siteIdentity = $Context.siteIdentity; accountId = $Context.accountId
         requestJson = $requestJson; requestHash = Get-JiraHash $requestJson
-        preview = @{ issueKey = $key; fields = $fields; links = $links; files = $files; placement = $placement; text = $text; rendering = $(if ($Kind -ceq 'description') { 'text' } else { 'attachment-links' }); inlineImages = $false; descriptionMode = 'append'; steps = @($steps | ForEach-Object { $_.kind }) }
+        preview = @{ issueKey = $key; fields = $fields; links = $links; files = $files; placement = $placement; text = $text; rendering = $(if ($Kind -cin @('description', 'comment')) { 'text' } else { 'attachment-links' }); inlineImages = $false; descriptionMode = $(if ($Kind -ceq 'comment') { $null } else { 'append' }); steps = @($steps | ForEach-Object { $_.kind }) }
         progress = @($steps | ForEach-Object { @{ status = 'pending'; result = $null; beforeAttachmentIds = @(); expectedDocument = $null } })
         result = $null
     }
@@ -237,7 +246,7 @@ function Set-JiraWorkflowStepComplete {
 function Complete-JiraWorkflow {
     param($Context, [string]$StatePath, $Operation, $Request)
     $key = Get-JiraWorkflowKey $Request $Operation
-    $rendering = if ($Request.steps.Count -eq 1 -and $Request.steps[0].kind -ceq 'description') { 'text' } else { 'attachment-links' }
+    $rendering = if ($Request.steps.Count -eq 1 -and $Request.steps[0].kind -cin @('description', 'comment')) { 'text' } else { 'attachment-links' }
     return (Complete-JiraOperation $StatePath $Operation @{ issueKey = $key; url = "$($Context.siteUrl)/browse/$key"; steps = $Operation.progress; rendering = $rendering; inlineImages = $false })
 }
 
@@ -384,7 +393,7 @@ function Sync-JiraIssueWorkflow {
             $comments = Get-JiraComments $Context $key
             $marker = "Операция: $($Operation.id)"
             $found = @($comments | Where-Object { (ConvertFrom-JiraDocument $_['body']).Contains($marker) })
-            if ($found.Count -eq 1 -and [string]$found[0].author.accountId -ceq $Context.accountId -and (Get-JiraValueHash $found[0].body) -ceq (Get-JiraValueHash $progress.expectedDocument)) { $result = @{ commentId = [string]$found[0].id; mode = 'comment-marker-verified' } }
+            if ($found.Count -eq 1 -and [string]$found[0].author.accountId -ceq $Context.accountId -and (Get-JiraValueHash $found[0].body -NormalizeEmptyParagraphs) -ceq (Get-JiraValueHash $progress.expectedDocument -NormalizeEmptyParagraphs)) { $result = @{ commentId = [string]$found[0].id; mode = 'comment-marker-verified' } }
         }
         'upload' {
             $issue = Get-JiraChangeIssue $Context $Binding $key -Fields @('project', 'attachment')
