@@ -52,9 +52,22 @@ function New-JiraHttpError {
 }
 
 function Send-JiraHttp {
-    param([Parameter(Mandatory)][System.Collections.IDictionary]$Context, [Parameter(Mandatory)][string]$Method, [Parameter(Mandatory)][string]$Resource, $Body, [switch]$Stream)
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Context, [Parameter(Mandatory)][string]$Method, [Parameter(Mandatory)][string]$Resource, $Body, [switch]$Stream, [switch]$WikiComment, [switch]$WikiDescription)
     Assert-JiraResource $Method $Resource
-    $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::new($Method), ($Context.apiBase + $Resource))
+    $apiBase = $Context.apiBase
+    if ($WikiComment) {
+        if ($Method -cne 'POST' -or $Resource -cnotmatch '^issue/[A-Z][A-Z0-9_]*-[1-9][0-9]*/comment\z' -or $apiBase -cnotmatch '/rest/api/3/\z' -or $Body -isnot [Collections.IDictionary] -or $Body.Count -ne 1 -or $Body['body'] -isnot [string]) {
+            throw 'REST v2 is limited to posting the reviewed image comment.'
+        }
+        $apiBase = $apiBase -creplace '/rest/api/3/\z', '/rest/api/2/'
+    }
+    if ($WikiDescription) {
+        if ($WikiComment -or $Method -cne 'PUT' -or $Resource -cnotmatch '^issue/[A-Z][A-Z0-9_]*-[1-9][0-9]*\z' -or $apiBase -cnotmatch '/rest/api/3/\z' -or $Body -isnot [Collections.IDictionary] -or $Body['fields'] -isnot [Collections.IDictionary] -or $Body['fields']['description'] -isnot [string]) {
+            throw 'REST v2 issue editing is limited to the reviewed wiki description.'
+        }
+        $apiBase = $apiBase -creplace '/rest/api/3/\z', '/rest/api/2/'
+    }
+    $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::new($Method), ($apiBase + $Resource))
     if (-not $Stream) { [void]$request.Headers.TryAddWithoutValidation('Accept', 'application/json') }
     if ($Body -is [Net.Http.MultipartFormDataContent]) {
         if ($Method -cne 'POST' -or $Resource -cnotmatch '^issue/[A-Z][A-Z0-9_]*-[1-9][0-9]*/attachments$') { $request.Dispose(); throw 'Multipart content is only supported for issue attachments.' }
@@ -81,8 +94,8 @@ function Send-JiraHttp {
 }
 
 function Invoke-JiraJson {
-    param([Parameter(Mandatory)][System.Collections.IDictionary]$Context, [Parameter(Mandatory)][string]$Method, [Parameter(Mandatory)][string]$Resource, $Body = $null)
-    $response = Send-JiraHttp $Context $Method $Resource $Body
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Context, [Parameter(Mandatory)][string]$Method, [Parameter(Mandatory)][string]$Resource, $Body = $null, [switch]$WikiComment, [switch]$WikiDescription)
+    $response = Send-JiraHttp $Context $Method $Resource $Body -WikiComment:$WikiComment -WikiDescription:$WikiDescription
     try {
         if ([int]$response.StatusCode -eq 204 -or $response.Content.Headers.ContentLength -eq 0) { return $null }
         try {

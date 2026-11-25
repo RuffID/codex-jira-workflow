@@ -44,10 +44,92 @@ function Get-JiraChangeIssue {
     return $issue
 }
 
+function Get-JiraImageCommentAttachment {
+    param($Issue, [string]$AttachmentId)
+    if ($AttachmentId -cnotmatch '^[1-9][0-9]*\z') { throw 'attachmentId must be a positive numeric Jira attachment ID.' }
+    $attachments = @($Issue.fields['attachment'] | Where-Object { $null -ne $_ })
+    $selected = @($attachments | Where-Object { [string]$_['id'] -ceq $AttachmentId })
+    if ($selected.Count -ne 1) { throw 'The selected attachment does not belong to this issue.' }
+    $image = $selected[0]
+    if ($image['mimeType'] -cnotin @('image/png', 'image/jpeg', 'image/gif', 'image/webp') -or $image['filename'] -notmatch '^[\p{L}\p{N}][\p{L}\p{N}._ -]*\.(png|jpe?g|gif|webp)\z') {
+        throw 'Select a PNG, JPEG, GIF or WebP attachment with a filename safe for Jira wiki image markup.'
+    }
+    if (@($attachments | Where-Object { $_['filename'] -ieq $image['filename'] }).Count -ne 1) { throw 'The image filename must be unique on the issue.' }
+    return @{ id = $AttachmentId; filename = [string]$image.filename; size = [long]$image.size; mimeType = [string]$image.mimeType }
+}
+
+function Get-JiraCommentImageBlocks {
+    param($Document)
+    if ($Document -isnot [Collections.IDictionary] -or $Document['type'] -cne 'doc') { return }
+    foreach ($block in $Document['content']) {
+        if ($null -eq $block -or $block['type'] -cne 'mediaSingle' -or $block['content'] -isnot [array] -or $block['content'].Count -ne 1) { continue }
+        $media = $block['content'][0]
+        if ($null -ne $media -and $media['type'] -ceq 'media' -and $media['attrs']['type'] -ceq 'file' -and $media['attrs']['id']) { $block }
+    }
+}
+
+function New-JiraAdaptiveImageBlock {
+    param($Block, [int]$Width, [int]$Height)
+    $source = $Block['content'][0]['attrs']
+    if ($Width -le 0 -or $Height -le 0 -or $source['collection'] -isnot [string]) { throw 'The image must have intrinsic dimensions and a Jira media collection.' }
+    $media = @{ type = 'file'; id = $source['id']; collection = $source['collection']; alt = $source['alt']; width = $Width; height = $Height }
+    return @{ type = 'mediaSingle'; attrs = @{ layout = 'align-start'; width = 100; widthType = 'percentage' }; content = @(@{ type = 'media'; attrs = $media }) }
+}
+
+function Get-JiraImageCommentSourceBlock {
+    param($Context, [string]$IssueKey, $Image, [string]$SourceCommentId)
+    if ($SourceCommentId -cnotmatch '^[1-9][0-9]*\z') { throw 'sourceCommentId must be a positive numeric Jira comment ID.' }
+    $comments = Get-JiraComments $Context $IssueKey
+    $source = @($comments | Where-Object { [string]$_['id'] -ceq $SourceCommentId })
+    if ($source.Count -ne 1 -or [string]$source[0]['author']['accountId'] -cne $Context.accountId -or $source[0]['visibility'] -or $source[0]['jsdPublic'] -eq $false) {
+        throw 'Select an unrestricted source comment you authored on the same issue.'
+    }
+    $blocks = @(Get-JiraCommentImageBlocks $source[0]['body'] | Where-Object { $_['content'][0]['attrs']['alt'] -ceq $Image.filename })
+    if ($blocks.Count -ne 1) { throw 'The source comment must contain exactly one embedded image matching the attachment filename.' }
+    $sourceBlock = $blocks[0]
+    $sourceMedia = $sourceBlock['content'][0]['attrs']
+    if (-not $sourceBlock['attrs']['layout'] -or $sourceMedia['collection'] -isnot [string]) { throw 'The source media block is missing layout or collection metadata.' }
+    $layout = @{ layout = $sourceBlock['attrs']['layout'] }
+    foreach ($field in 'width', 'widthType') {
+        if ($sourceBlock['attrs'].Contains($field)) { $layout[$field] = $sourceBlock['attrs'][$field] }
+    }
+    # Reuse the Jira media reference and display settings without copying editor-local IDs.
+    $media = @{ type = 'file'; id = $sourceMedia['id']; collection = $sourceMedia['collection']; alt = $Image.filename }
+    foreach ($field in 'width', 'height') {
+        if ($sourceMedia.Contains($field)) { $media[$field] = $sourceMedia[$field] }
+    }
+    return @{ type = 'mediaSingle'; attrs = $layout; content = @(@{ type = 'media'; attrs = $media }) }
+}
+
+function Get-JiraImageCommentResult {
+    param($Context, [string]$IssueKey, $Step, [string]$OperationId, [string]$CommentId = '')
+    $marker = "Операция: $OperationId"
+    $comments = Get-JiraComments $Context $IssueKey
+    $found = @($comments | Where-Object { (ConvertFrom-JiraDocument $_['body']) -csplit '\r?\n' -ccontains $marker })
+    if ($found.Count -ne 1 -or [string]$found[0].author.accountId -cne $Context.accountId -or ($CommentId -and [string]$found[0].id -cne $CommentId)) { return $null }
+    $body = $found[0].body
+    $blocks = @(Get-JiraCommentImageBlocks $body)
+    $inline = $blocks.Count -eq 1 -and (ConvertFrom-JiraDocument $body).Trim() -ceq $marker
+    $result = @{ commentId = [string]$found[0].id; inlineImages = $false }
+    if ($inline) {
+        $actualMedia = $blocks[0]['content'][0]['attrs']
+        $result.inlineImages = -not $actualMedia['alt'] -or $actualMedia['alt'] -ceq $Step.image.filename
+    }
+    if ($Step.Contains('imageBlock')) {
+        $expected = $Step.imageBlock
+        $result.layoutMatched = $result.inlineImages -and $actualMedia['id'] -ceq $expected.content[0].attrs.id -and
+            $blocks[0]['attrs']['layout'] -ceq $expected.attrs['layout'] -and
+            $blocks[0]['attrs']['widthType'] -ceq $expected.attrs['widthType'] -and
+            $blocks[0]['attrs']['width'] -eq $expected.attrs['width'] -and
+            $actualMedia['width'] -eq $expected.content[0].attrs['width'] -and
+            $actualMedia['height'] -eq $expected.content[0].attrs['height']
+    }
+    return $result
+}
+
 function Get-JiraUploadFiles {
     param([Collections.IDictionary]$InputData)
     if (-not $InputData.Contains('files') -or $InputData.files -isnot [array] -or $InputData.files.Count -eq 0) { throw 'files must be a nonempty JSON array of absolute file paths.' }
-    if ($InputData['rendering'] -cne 'links') { throw 'Specify rendering=links explicitly. Inline media is unavailable through the supported public v3 attachment API; do not silently replace requested inline images with links.' }
     $files = @(
         foreach ($path in $InputData.files) {
             if ($path -isnot [string] -or -not [IO.Path]::IsPathFullyQualified($path)) { throw 'Every upload path must be an absolute local file path.' }
@@ -61,6 +143,63 @@ function Get-JiraUploadFiles {
     )
     if (@($files.path | Sort-Object -Unique).Count -ne $files.Count) { throw 'Duplicate upload paths are not allowed.' }
     return ,$files
+}
+
+function Set-JiraInlineUploadDimensions {
+    param([array]$Files)
+    if (@($Files.filename | Sort-Object -Unique).Count -ne $Files.Count) { throw 'Each inline image must have a unique filename.' }
+    foreach ($file in $Files) {
+        if ($file.filename -notmatch '^[\p{L}\p{N}][\p{L}\p{N}._ -]*\.(png|jpe?g|gif)\z') { throw 'New inline images must be PNG, JPEG or GIF with a filename safe for Jira wiki markup.' }
+        $stream = [IO.File]::OpenRead($file.path)
+        try {
+            $image = [Drawing.Image]::FromStream($stream, $false, $true)
+            try {
+                $format = switch ([IO.Path]::GetExtension($file.filename).ToLowerInvariant()) {
+                    '.png' { [Drawing.Imaging.ImageFormat]::Png }
+                    '.gif' { [Drawing.Imaging.ImageFormat]::Gif }
+                    default { [Drawing.Imaging.ImageFormat]::Jpeg }
+                }
+                if ($image.RawFormat.Guid -ne $format.Guid) { throw 'The image format does not match the filename.' }
+                $file.width = $image.Width
+                $file.height = $image.Height
+            } finally { $image.Dispose() }
+        } finally { $stream.Dispose() }
+    }
+}
+
+function Get-JiraResolvedDescriptionImages {
+    param($Description, [array]$Files, [string]$Marker)
+    if ($Description -isnot [Collections.IDictionary] -or $Description['type'] -cne 'doc' -or $Description['version'] -ne 1 -or (ConvertFrom-JiraDocument $Description).Trim() -cne $Marker) { return $null }
+    $blocks = @(Get-JiraCommentImageBlocks $Description)
+    if ($Files.Count -eq 0 -or $blocks.Count -ne $Files.Count) { return $null }
+    foreach ($node in $Description.content) {
+        if ($node['type'] -ceq 'mediaSingle') { continue }
+        if ($node['type'] -cne 'paragraph' -or @($node['content'] | Where-Object { $null -ne $_ -and $_['type'] -cne 'text' }).Count) { return $null }
+    }
+    $ids = [Collections.Generic.HashSet[guid]]::new()
+    $images = @(for ($i = 0; $i -lt $Files.Count; $i++) {
+        $media = $blocks[$i]['content'][0]['attrs']
+        $mediaId = [guid]::Empty
+        if (-not [guid]::TryParseExact([string]$media['id'], 'D', [ref]$mediaId) -or $mediaId -eq [guid]::Empty -or -not $ids.Add($mediaId) -or
+            ($media['alt'] -and $media['alt'] -cne $Files[$i].filename) -or $media['collection'] -isnot [string]) { return $null }
+        $image = New-JiraAdaptiveImageBlock $blocks[$i] $Files[$i].width $Files[$i].height
+        $image.content[0].attrs.alt = $Files[$i].filename
+        $image
+    })
+    return @{ descriptionHash = Get-JiraDescriptionHash $Description; images = $images }
+}
+
+function Get-JiraVerifiedInlineUploads {
+    param($Issue, $Request, $Operation)
+    for ($i = 0; $i -lt $Request.steps.Count; $i++) {
+        if ($Request.steps[$i].kind -cne 'upload') { continue }
+        $upload = $Operation.progress[$i]
+        if ($upload.status -cne 'completed') { throw 'The image upload is not verified.' }
+        $file = $Request.steps[$i].file
+        $attachment = Get-JiraImageCommentAttachment $Issue $upload.result.attachmentId
+        if ($attachment.filename -cne $file.filename -or $attachment.size -ne $file.size) { throw 'The uploaded image changed before description publication.' }
+        $file
+    }
 }
 
 function Assert-JiraUploadSettings {
@@ -103,7 +242,7 @@ function Get-JiraPreparedLinks {
 }
 
 function New-JiraIssueWorkflowProposal {
-    param($Context, $Binding, [string]$StatePath, [ValidateSet('create', 'link', 'attachments', 'description', 'comment')][string]$Kind, [Collections.IDictionary]$InputData, [string]$OperationId = '')
+    param($Context, $Binding, [string]$StatePath, [ValidateSet('create', 'link', 'attachments', 'description', 'comment', 'imageComment')][string]$Kind, [Collections.IDictionary]$InputData, [string]$OperationId = '')
     $id = if ($OperationId) { ([guid]::ParseExact($OperationId, 'D')).ToString('D') } else { [guid]::NewGuid().ToString('D') }
     $path = Get-JiraOperationPath $StatePath $id
     Assert-JiraPlainPath $path
@@ -117,6 +256,9 @@ function New-JiraIssueWorkflowProposal {
     $text = ''
     $links = @()
     $fields = $null
+    $image = $null
+    $imageBlock = $null
+    $rendering = 'attachment-links'
     switch ($Kind) {
         'create' {
             Assert-JiraInputKeys $InputData @('fields', 'links', 'attachments')
@@ -148,15 +290,49 @@ function New-JiraIssueWorkflowProposal {
             $attachmentInput = $InputData
         }
         'description' {
-            Assert-JiraInputKeys $InputData @('issueKey', 'text')
+            Assert-JiraInputKeys $InputData @('issueKey', 'text', 'attachmentId', 'resizeExisting')
             if ($InputData['text'] -isnot [string] -or [string]::IsNullOrWhiteSpace($InputData['text'])) { throw 'Description text must be a nonempty string.' }
+            if ($InputData.Contains('resizeExisting') -and $InputData['resizeExisting'] -isnot [bool]) { throw 'resizeExisting must be a boolean.' }
+            $resizeExisting = $InputData['resizeExisting'] -eq $true
+            if ($resizeExisting -and -not $InputData.Contains('attachmentId')) { throw 'Specify attachmentId to resize an image below the supplied caption.' }
             $key = [string]$InputData['issueKey']
-            $issue = Get-JiraChangeIssue $Context $Binding $key -Fields @('project', 'description')
+            $descriptionFields = @('project', 'description')
+            if ($InputData.Contains('attachmentId')) { $descriptionFields += 'attachment' }
+            $issue = Get-JiraChangeIssue $Context $Binding $key -Fields $descriptionFields
             $baseDescription = $issue.fields['description']
             Assert-JiraChangeDocument $baseDescription
             $placement = 'description'
             $text = $InputData.text
-            $steps.Add(@{ kind = 'description'; text = $text; baseDescription = $baseDescription })
+            $rendering = 'text'
+            $descriptionStep = @{ kind = 'description'; text = $text; baseDescription = $baseDescription }
+            if ($InputData.Contains('attachmentId')) {
+                $image = Get-JiraImageCommentAttachment $issue ([string]$InputData['attachmentId'])
+                $source = @(Get-JiraCommentImageBlocks $baseDescription | Where-Object { $_['content'][0]['attrs']['alt'] -ceq $image.filename })
+                if ($resizeExisting) {
+                    $caption = (ConvertTo-JiraDocument $text).content
+                    $source = @($source | Where-Object {
+                        $index = [array]::IndexOf($baseDescription.content, $_)
+                        $index -ge $caption.Count -and (Get-JiraValueHash @($baseDescription.content[($index - $caption.Count)..($index - 1)]) -NormalizeEmptyParagraphs) -ceq
+                            (Get-JiraValueHash $caption -NormalizeEmptyParagraphs)
+                    })
+                }
+                if ($source.Count -ne 1) { throw 'The description must contain exactly one embedded block matching the selected image and any supplied caption for resizing.' }
+                $media = $source[0]['content'][0]['attrs']
+                $imageBlock = New-JiraAdaptiveImageBlock $source[0] ([int]$media['width']) ([int]$media['height'])
+                $descriptionStep.image = $image
+                $descriptionStep.sourceImageIndex = [array]::IndexOf($baseDescription.content, $source[0])
+                if ($descriptionStep.sourceImageIndex -lt 0) { throw 'Could not locate the source image in the prepared description.' }
+                if ($resizeExisting) {
+                    $resized = @{} + $source[0]
+                    $resized.attrs = @{} + $source[0]['attrs']
+                    foreach ($field in $imageBlock.attrs.Keys) { $resized.attrs[$field] = $imageBlock.attrs[$field] }
+                    $imageBlock = $resized
+                    $descriptionStep.resizeExisting = $true
+                }
+                $descriptionStep.imageBlock = $imageBlock
+                $rendering = 'adf-image'
+            }
+            $steps.Add($descriptionStep)
         }
         'comment' {
             Assert-JiraInputKeys $InputData @('issueKey', 'text')
@@ -165,21 +341,53 @@ function New-JiraIssueWorkflowProposal {
             [void](Get-JiraChangeIssue $Context $Binding $key -Fields @('project'))
             $placement = 'comment'
             $text = $InputData.text
+            $rendering = 'text'
             $steps.Add(@{ kind = 'comment'; text = $text })
+        }
+        'imageComment' {
+            Assert-JiraInputKeys $InputData @('issueKey', 'attachmentId', 'sourceCommentId')
+            $key = [string]$InputData['issueKey']
+            $issue = Get-JiraChangeIssue $Context $Binding $key -Fields @('project', 'attachment')
+            $image = Get-JiraImageCommentAttachment $issue ([string]$InputData['attachmentId'])
+            $placement = 'comment'
+            $rendering = 'wiki-image'
+            $imageStep = @{ kind = 'imageComment'; image = $image }
+            if ($InputData.Contains('sourceCommentId')) {
+                $imageStep.sourceCommentId = [string]$InputData['sourceCommentId']
+                $imageBlock = Get-JiraImageCommentSourceBlock $Context $key $image $imageStep.sourceCommentId
+                $imageStep.imageBlock = $imageBlock
+                $rendering = 'adf-image'
+            }
+            $steps.Add($imageStep)
         }
     }
     if ($null -ne $attachmentInput) {
-        $files = Get-JiraUploadFiles $attachmentInput
-        Assert-JiraUploadSettings $Context $files
         $placement = if ($attachmentInput.Contains('placement')) { $attachmentInput.placement } elseif ($Kind -ceq 'create') { 'description' } else { 'comment' }
         if ($placement -cnotin @('description', 'comment')) { throw 'placement must be description or comment.' }
+        $inlineUpload = $attachmentInput['rendering'] -ceq 'inline-images'
+        if ($inlineUpload -and ($Kind -cne 'create' -or $placement -cne 'description')) { throw 'inline-images is available for the description of a newly created issue.' }
+        if (-not $inlineUpload -and $attachmentInput['rendering'] -cne 'links') { throw 'Specify rendering=links or rendering=inline-images explicitly.' }
+        $files = Get-JiraUploadFiles $attachmentInput
+        Assert-JiraUploadSettings $Context $files
         if ($attachmentInput.Contains('text')) {
             if ($attachmentInput.text -isnot [string]) { throw 'Attachment text must be a string.' }
             $text = $attachmentInput.text
         }
         if ($placement -ceq 'description') { Assert-JiraChangeDocument $baseDescription }
         foreach ($file in $files) { $steps.Add(@{ kind = 'upload'; file = $file }) }
-        $steps.Add(@{ kind = $placement; text = $text; baseDescription = $baseDescription })
+        $publish = @{ kind = $placement; text = $text; baseDescription = $baseDescription }
+        if ($inlineUpload) {
+            Set-JiraInlineUploadDimensions $files
+            $rendering = 'inline-images'
+            $marker = "Операция: $id"
+            $initial = ConvertTo-JiraDocument $marker
+            $initialFields = @{} + $fields
+            $initialFields.description = $initial
+            $steps[0].body.fields = $initialFields
+            $publish.imagesFromStep = $steps.Count
+            $steps.Add(@{ kind = 'resolveDescriptionImages'; initialDescription = $initial; marker = $marker })
+        }
+        $steps.Add($publish)
     }
     foreach ($link in $links) { $steps.Add(@{ kind = 'link'; link = $link }) }
     if ($steps.Count -eq 0) { throw 'The proposal contains no changes.' }
@@ -189,9 +397,14 @@ function New-JiraIssueWorkflowProposal {
         schemaVersion = 1; id = $id; status = 'prepared'; createdAt = [datetimeoffset]::UtcNow.ToString('o'); completedAt = $null
         repositoryPath = $Binding.path; siteIdentity = $Context.siteIdentity; accountId = $Context.accountId
         requestJson = $requestJson; requestHash = Get-JiraHash $requestJson
-        preview = @{ issueKey = $key; fields = $fields; links = $links; files = $files; placement = $placement; text = $text; rendering = $(if ($Kind -cin @('description', 'comment')) { 'text' } else { 'attachment-links' }); inlineImages = $false; descriptionMode = $(if ($Kind -ceq 'comment') { $null } else { 'append' }); steps = @($steps | ForEach-Object { $_.kind }) }
+        preview = @{ issueKey = $key; fields = $fields; links = $links; files = $files; placement = $placement; text = $text; rendering = $rendering; inlineImages = $false; descriptionMode = $(if ($Kind -cin @('comment', 'imageComment')) { $null } elseif ($steps[0].Contains('resizeExisting')) { 'resize-image' } else { 'append' }); steps = @($steps | ForEach-Object { $_.kind }) }
         progress = @($steps | ForEach-Object { @{ status = 'pending'; result = $null; beforeAttachmentIds = @(); expectedDocument = $null } })
         result = $null
+    }
+    if ($null -ne $image) { $operation.preview.image = $image }
+    if ($null -ne $imageBlock) {
+        $operation.preview.imageLayout = $imageBlock.attrs
+        if ($Kind -ceq 'imageComment') { $operation.preview.sourceCommentId = $imageStep.sourceCommentId }
     }
     Save-JiraOperation $StatePath $operation
     return $operation
@@ -220,8 +433,28 @@ function Get-JiraObservedLink {
 function New-JiraAttachmentDocument {
     param($Context, $Request, $Operation, $Step)
     $content = @()
+    if ($Step.kind -ceq 'description' -and $Step.Contains('sourceImageIndex')) {
+        $original = $Step.baseDescription.content
+        $content = @(for ($i = 0; $i -lt $original.Count; $i++) {
+            if ($i -eq $Step.sourceImageIndex -and $Step.Contains('resizeExisting')) {
+                $Step.imageBlock
+                continue
+            }
+            $original[$i]
+            if ($i -eq $Step.sourceImageIndex) {
+                (ConvertTo-JiraDocument $Step.text).content
+                $Step.imageBlock
+            }
+        })
+        return @{ type = 'doc'; version = 1; content = $content }
+    }
     if ($Step.kind -ceq 'description' -and $null -ne $Step.baseDescription) { $content += @($Step.baseDescription.content) }
     if ($Step.text) { $content += @((ConvertTo-JiraDocument $Step.text).content) }
+    if ($Step.Contains('imagesFromStep')) {
+        $resolved = $Operation.progress[$Step.imagesFromStep]
+        if ($resolved.status -cne 'completed') { throw 'Jira image references have not been verified.' }
+        return @{ type = 'doc'; version = 1; content = $content + @($resolved.result.images) }
+    }
     for ($i = 0; $i -lt $Request.steps.Count; $i++) {
         if ($Request.steps[$i].kind -cne 'upload') { continue }
         $progress = $Operation.progress[$i]
@@ -246,6 +479,21 @@ function Set-JiraWorkflowStepComplete {
 function Complete-JiraWorkflow {
     param($Context, [string]$StatePath, $Operation, $Request)
     $key = Get-JiraWorkflowKey $Request $Operation
+    if ($Request.steps[0].kind -ceq 'imageComment') {
+        $imageResult = $Operation.progress[0].result
+        $result = @{ issueKey = $key; url = "$($Context.siteUrl)/browse/$key"; steps = $Operation.progress; rendering = 'wiki-image'; inlineImages = $imageResult.inlineImages }
+        if ($Request.steps[0].Contains('imageBlock')) {
+            $result.rendering = 'adf-image'
+            $result.layoutMatched = $imageResult.layoutMatched
+        }
+        return (Complete-JiraOperation $StatePath $Operation $result)
+    }
+    if ($Request.steps[0].Contains('sourceImageIndex')) {
+        return (Complete-JiraOperation $StatePath $Operation @{ issueKey = $key; url = "$($Context.siteUrl)/browse/$key"; steps = $Operation.progress; rendering = 'adf-image'; inlineImages = $true })
+    }
+    if (@($Request.steps | Where-Object { $_.Contains('imagesFromStep') }).Count) {
+        return (Complete-JiraOperation $StatePath $Operation @{ issueKey = $key; url = "$($Context.siteUrl)/browse/$key"; steps = $Operation.progress; rendering = 'inline-images'; inlineImages = $true })
+    }
     $rendering = if ($Request.steps.Count -eq 1 -and $Request.steps[0].kind -cin @('description', 'comment')) { 'text' } else { 'attachment-links' }
     return (Complete-JiraOperation $StatePath $Operation @{ issueKey = $key; url = "$($Context.siteUrl)/browse/$key"; steps = $Operation.progress; rendering = $rendering; inlineImages = $false })
 }
@@ -276,6 +524,8 @@ function Invoke-JiraIssueWorkflow {
         $body = $null
         $resource = ''
         $method = 'POST'
+        $wikiComment = $false
+        $wikiDescription = $false
         switch ($step.kind) {
             'create' { Assert-JiraCreatePayload $Context $Binding $step.body.fields; $body = $step.body; $resource = 'issue' }
             'link' {
@@ -305,9 +555,38 @@ function Invoke-JiraIssueWorkflow {
                 $body = @{ body = $progress.expectedDocument }
                 $resource = "issue/$key/comment"
             }
+            'imageComment' {
+                $issue = Get-JiraChangeIssue $Context $Binding $key -Fields @('project', 'attachment')
+                $image = Get-JiraImageCommentAttachment $issue $step.image.id
+                if ((Get-JiraValueHash $image) -cne (Get-JiraValueHash $step.image)) { throw 'The selected image changed after preparation; no comment was sent.' }
+                $marker = "Операция: $($Operation.id)"
+                if ($step.Contains('imageBlock')) {
+                    $sourceBlock = Get-JiraImageCommentSourceBlock $Context $key $image $step.sourceCommentId
+                    if ((Get-JiraValueHash $sourceBlock) -cne (Get-JiraValueHash $step.imageBlock)) { throw 'The source image layout changed after preparation; no comment was sent.' }
+                    $document = ConvertTo-JiraDocument $marker
+                    $document.content = @($step.imageBlock) + $document.content
+                    $body = @{ body = $document }
+                } else {
+                    $body = @{ body = "!$($image.filename)!`n`n$marker" }
+                    $wikiComment = $true
+                }
+                $resource = "issue/$key/comment"
+            }
+            'resolveDescriptionImages' {
+                $issue = Get-JiraChangeIssue $Context $Binding $key -Fields @('project', 'description', 'attachment')
+                if ((Get-JiraDescriptionHash $issue.fields['description']) -cne (Get-JiraDescriptionHash $step.initialDescription)) { throw 'The initial description changed; image resolution was not sent.' }
+                $uploads = @(Get-JiraVerifiedInlineUploads $issue $Request $Operation)
+                $references = @($uploads | ForEach-Object { '!{0}|alt="{0}"!' -f $_.filename })
+                $body = @{ fields = @{ description = ((@($step.marker) + $references) -join "`n`n") } }
+                $method = 'PUT'; $resource = "issue/$key"; $wikiDescription = $true
+            }
             'description' {
-                $issue = Get-JiraChangeIssue $Context $Binding $key -Fields @('project', 'description')
-                if ((Get-JiraDescriptionHash $issue.fields['description']) -cne (Get-JiraDescriptionHash $step.baseDescription)) { throw 'Description changed after preparation; existing content was not overwritten.' }
+                $descriptionFields = @('project', 'description')
+                if ($step.Contains('image')) { $descriptionFields += 'attachment' }
+                $issue = Get-JiraChangeIssue $Context $Binding $key -Fields $descriptionFields
+                $expectedHash = if ($step.Contains('imagesFromStep')) { $Operation.progress[$step.imagesFromStep].result.descriptionHash } else { Get-JiraDescriptionHash $step.baseDescription }
+                if ((Get-JiraDescriptionHash $issue.fields['description']) -cne $expectedHash) { throw 'Description changed after preparation; existing content was not overwritten.' }
+                if ($step.Contains('image') -and (Get-JiraValueHash (Get-JiraImageCommentAttachment $issue $step.image.id)) -cne (Get-JiraValueHash $step.image)) { throw 'The selected image changed after preparation; the description was not updated.' }
                 $progress.expectedDocument = New-JiraAttachmentDocument $Context $Request $Operation $step
                 $body = @{ fields = @{ description = $progress.expectedDocument } }
                 $method = 'PUT'; $resource = "issue/$key"
@@ -318,7 +597,7 @@ function Invoke-JiraIssueWorkflow {
         Save-JiraOperation $StatePath $Operation
         $accepted = $false
         try {
-            $response = if ($step.kind -ceq 'upload') { Send-JiraAttachment $Context $key $step.file } else { Invoke-JiraJson $Context $method $resource $body }
+            $response = if ($step.kind -ceq 'upload') { Send-JiraAttachment $Context $key $step.file } else { Invoke-JiraJson $Context $method $resource $body -WikiComment:$wikiComment -WikiDescription:$wikiDescription }
             $accepted = $true
             switch ($step.kind) {
                 'create' {
@@ -334,6 +613,17 @@ function Invoke-JiraIssueWorkflow {
                 'comment' {
                     if (-not $response -or -not $response['id']) { throw 'Comment ID was not returned.' }
                     $result = @{ commentId = [string]$response.id }
+                }
+                'imageComment' {
+                    if (-not $response -or -not $response['id']) { throw 'Comment ID was not returned.' }
+                    $result = Get-JiraImageCommentResult $Context $key $step $Operation.id ([string]$response.id)
+                    if ($null -eq $result) { throw 'The new image comment could not be verified.' }
+                }
+                'resolveDescriptionImages' {
+                    $issue = Get-JiraChangeIssue $Context $Binding $key -Fields @('project', 'description', 'attachment')
+                    $uploads = @(Get-JiraVerifiedInlineUploads $issue $Request $Operation)
+                    $result = Get-JiraResolvedDescriptionImages $issue.fields['description'] $uploads $step.marker
+                    if ($null -eq $result) { throw 'Jira did not return valid embedded images for the uploaded files.' }
                 }
                 'link' {
                     $issue = Get-JiraChangeIssue $Context $Binding $key -Fields @('project', 'issuelinks')
@@ -394,6 +684,15 @@ function Sync-JiraIssueWorkflow {
             $marker = "Операция: $($Operation.id)"
             $found = @($comments | Where-Object { (ConvertFrom-JiraDocument $_['body']).Contains($marker) })
             if ($found.Count -eq 1 -and [string]$found[0].author.accountId -ceq $Context.accountId -and (Get-JiraValueHash $found[0].body -NormalizeEmptyParagraphs) -ceq (Get-JiraValueHash $progress.expectedDocument -NormalizeEmptyParagraphs)) { $result = @{ commentId = [string]$found[0].id; mode = 'comment-marker-verified' } }
+        }
+        'imageComment' {
+            [void](Get-JiraChangeIssue $Context $Binding $key -Fields @('project'))
+            $result = Get-JiraImageCommentResult $Context $key $step $Operation.id
+        }
+        'resolveDescriptionImages' {
+            $issue = Get-JiraChangeIssue $Context $Binding $key -Fields @('project', 'description', 'attachment')
+            $uploads = @(Get-JiraVerifiedInlineUploads $issue $Request $Operation)
+            $result = Get-JiraResolvedDescriptionImages $issue.fields['description'] $uploads $step.marker
         }
         'upload' {
             $issue = Get-JiraChangeIssue $Context $Binding $key -Fields @('project', 'attachment')
